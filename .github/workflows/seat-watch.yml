@@ -1,0 +1,89 @@
+name: Cinema City adjacent-seat watchdog
+
+on:
+  schedule:
+    - cron: "13,43 * * * *"
+  workflow_dispatch:
+    inputs:
+      diagnostic:
+        description: "Uložit screenshoty a normalizovaná data sedadel"
+        type: boolean
+        default: false
+
+concurrency:
+  group: seat-watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Nainstalovat Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Zkontrolovat živé mapy sedadel
+        id: seats
+        run: |
+          python3 seat_watch.py \
+            --schedule-state state/seen.json \
+            --seat-state state/seats.json \
+            --report seat-report.md \
+            --title seat-title.txt \
+            ${{ inputs.diagnostic && '--diagnostic' || '' }}
+
+      - name: Nahlásit novou dvojici
+        if: steps.seats.outputs.has_news == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=$(gh issue create \
+            --title "$(cat seat-title.txt)" \
+            --body-file seat-report.md \
+            --assignee "${{ github.repository_owner }}")
+          echo "Založeno: $url"
+          gh issue close "$url" --reason completed
+
+      - name: Nahrát diagnostiku
+        if: always() && inputs.diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: seat-map-diagnostics
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Uložit stav sedadel
+        run: |
+          rm -f seat-report.md seat-title.txt
+          if [ ! -f state/seats.json ]; then
+            echo "Nevznikl stav sedadel."
+            exit 0
+          fi
+          if git diff --quiet -- state/seats.json && git ls-files --error-unmatch state/seats.json >/dev/null 2>&1; then
+            echo "Stav sedadel beze změny."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- state/seats.json
+          git commit -m "Aktualizace stavu sedadel ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+          for i in 1 2 3; do
+            git pull --rebase --quiet origin "${GITHUB_REF_NAME}" && git push && exit 0
+            sleep 5
+          done
+          echo "::error::Push stavu sedadel se nepovedl."
+          exit 1
